@@ -1,61 +1,3 @@
-// var logs []string
-// var logsList *widget.List
-// func main() {
-// 	debug.SetGCPercent(-1)
-// 	a := app.New()
-// 	w := a.NewWindow("TLS Tunnel Client")
-// 	a.Settings().SetTheme(theme.LightTheme())
-// 	w.SetFixedSize(true)
-// 	w.Resize(fyne.NewSize(400, 400))
-// 	w.CenterOnScreen()
-// 	// vars
-// 	connectTo := "135.181.88.125:8080"
-// 	listenOn := "127.0.0.1:1194"
-// 	// bindings
-// 	connectToBinding := binding.BindString(&connectTo)
-// 	listenOnBinding := binding.BindString(&listenOn)
-// 	connectToWidget := widget.NewEntry()
-// 	connectToWidget.SetPlaceHolder("Enter text...")
-// 	connectToWidget.Bind(connectToBinding)
-// 	connectToWidget.OnChanged = func(s string) {}
-// 	listenOnEntry := widget.NewEntry()
-// 	listenOnEntry.SetPlaceHolder("Enter text...")
-// 	listenOnEntry.Bind(listenOnBinding)
-// 	listenOnLable := widget.NewLabel("Connect To")
-// 	connectToLable := widget.NewLabel("Listen On")
-// 	formsContainer := container.New(layout.NewFormLayout(),
-// 		connectToLable, listenOnEntry, listenOnLable, connectToWidget,
-// 	)
-// 	var connectButton *widget.Button
-// 	connectButton = widget.NewButton("connect", func() {
-// 		go func() {
-// 			connectButton.SetText("disconnect")
-// 			success := runClient(listenOn, connectTo)
-// 			if !success {
-// 				connectButton.SetText("connect")
-// 			}
-// 		}()
-// 	})
-// 	buttonsContainer := container.New(layout.NewHBoxLayout(),
-// 		layout.NewSpacer(), connectButton, layout.NewSpacer(),
-// 	)
-// 	logsList = widget.NewList(
-// 		func() int {
-// 			return len(logs)
-// 		},
-// 		func() fyne.CanvasObject {
-// 			return widget.NewLabel("")
-// 		},
-// 		func(i widget.ListItemID, o fyne.CanvasObject) {
-// 			o.(*widget.Label).SetText(logs[i])
-// 		},
-// 	)
-// 	logsListContainer := container.NewBorder(widget.NewLabel("Logs:"), nil, nil, nil, logsList)
-// 	content := container.NewBorder(formsContainer, buttonsContainer, nil, nil, logsListContainer)
-// 	w.SetContent(content)
-// 	w.ShowAndRun()
-// }
-
 package main
 
 import (
@@ -64,7 +6,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"sync"
 )
 
 var config ClientConfig
@@ -72,6 +13,7 @@ var config ClientConfig
 type ClientConfig struct {
 	Connect             string `json:"connect"`
 	Listen              string `json:"listen"`
+	Protocol            string `json:"protocol"`
 	CertificateLocation string `json:"certificateLocation"`
 	KeyLocation         string `json:"KeyLocation"`
 	TLSConfig           tls.Config
@@ -109,7 +51,7 @@ func loadCertificates(config *ClientConfig) {
 	logMessage("certificates loaded")
 }
 
-func handleLocalClient(localConnection net.Conn, err error) {
+func handleLocalTCPClient(localConnection net.Conn, err error) {
 	defer localConnection.Close()
 
 	// check if connection was successfull else exit go routine
@@ -127,39 +69,19 @@ func handleLocalClient(localConnection net.Conn, err error) {
 	defer remoteConnection.Close()
 	logMessage(localConnection.LocalAddr().String() + " connected to " + config.Connect)
 
-	// create wait group for go routines
-	var wg sync.WaitGroup
-
-	// listen for incoming traffic from local app and forward it to remote machine
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
-
-		buff := make([]byte, 8192)
-
+		buff := make([]byte, 1024*16)
 		for {
 			readBytes, _ := localConnection.Read(buff) // TODO: check for error
 			remoteConnection.Write(buff[:readBytes])   // TODO: check for error
 		}
 	}()
 
-	// listen for incoming traffic from remote machine and forward it to local app
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		buff := make([]byte, 8192)
-
-		for {
-			readBytes, _ := remoteConnection.Read(buff) // TODO: check for error
-			localConnection.Write(buff[:readBytes])     // TODO: check for error
-		}
-	}()
-
-	// wait for go routines to finish
-	wg.Wait()
-
-	logMessage("connection closed")
+	buff := make([]byte, 1024*16)
+	for {
+		readBytes, _ := remoteConnection.Read(buff) // TODO: check for error
+		localConnection.Write(buff[:readBytes])     // TODO: check for error
+	}
 }
 
 func main() {
@@ -169,15 +91,63 @@ func main() {
 	config.TLSConfig.MinVersion = tls.VersionTLS13
 
 	// create listener on local machine
-	// if config.Protocol == "tcp" {
-	var err error
-	localListener, err := net.Listen("tcp", config.Listen)
-	handleError(err, true)
-	logMessage("listening on " + config.Listen)
+	if config.Protocol == "tcp" {
+		localListener, err := net.Listen("tcp", config.Listen)
+		handleError(err, true)
+		logMessage("listening on " + config.Listen)
+		defer localListener.Close()
 
-	// accept new connections from local apps
-	for {
-		localConnection, err := localListener.Accept()
-		go handleLocalClient(localConnection, err)
+		// accept new connections from local apps
+		for {
+			localConnection, err := localListener.Accept()
+			go handleLocalTCPClient(localConnection, err)
+		}
+	} else {
+		defer logMessage("connection closed")
+
+		// intial local client address to avoid extra allocations
+		var localClientAddress *net.UDPAddr
+
+		// create local udp listener
+		listenAddress, err := net.ResolveUDPAddr("udp", config.Listen)
+		handleError(err, true)
+		localConnection, err := net.ListenUDP("udp", listenAddress)
+		handleError(err, true)
+		logMessage("listening on " + config.Listen)
+
+		// create tcp tunnel to serer
+		remoteConnection, err := tls.Dial("tcp", config.Connect, &config.TLSConfig)
+		handleError(err, true)
+		logMessage("connected to " + config.Connect)
+
+		// listen for incoming traffic from local app and forward it to remote machine
+		go func() {
+			// read the first chunk to get local client address and forward the chunk
+			defer localConnection.Close()
+			buff := make([]byte, 1024*16)
+			var readBytes int
+			readBytes, localClientAddress, err = localConnection.ReadFromUDP(buff)
+			_, err = remoteConnection.Write(buff[:readBytes])
+			handleError(err, false)
+			// repeat the last step in a loop
+			for {
+				readBytes, _, err = localConnection.ReadFromUDP(buff)
+				if handleError(err, false) {
+					break
+				}
+				remoteConnection.Write(buff[:readBytes])
+			}
+		}()
+
+		// listen for incoming traffic from remote machine and forward it to local app
+		defer remoteConnection.Close()
+		buff := make([]byte, 1024*16)
+		for {
+			readBytes, err := remoteConnection.Read(buff)
+			if handleError(err, false) {
+				break
+			}
+			localConnection.WriteToUDP(buff[:readBytes], localClientAddress)
+		}
 	}
 }
