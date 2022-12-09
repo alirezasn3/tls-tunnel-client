@@ -3,14 +3,26 @@ package main
 import (
 	"crypto/tls"
 	"encoding/json"
+	"io"
 	"log"
 	"net"
 	"os"
+	"sync"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/widget"
 )
 
-var config ClientConfig
+var configs []ClientConfig
+
+var fyneLogsChannel = make(chan string)
+
+var fyneLogs []string
 
 type ClientConfig struct {
+	ServiceName         string `json:"serviceName"`
 	Connect             string `json:"connect"`
 	Listen              string `json:"listen"`
 	Protocol            string `json:"protocol"`
@@ -19,135 +31,191 @@ type ClientConfig struct {
 	TLSConfig           tls.Config
 }
 
-func handleError(err error, fatal bool) bool {
+func handleError(err error, fatal bool, config *ClientConfig) bool {
 	if err != nil {
 		if fatal {
-			log.Fatalln("[error] ", err)
+			log.Fatalln("["+config.ServiceName+"]"+" [error] ", err)
+			fyneLogsChannel <- "[" + config.ServiceName + "]" + " [error] " + err.Error()
 		} else {
-			log.Println("[error] ", err)
+			log.Println("["+config.ServiceName+"]"+" [error] ", err)
+			fyneLogsChannel <- "[" + config.ServiceName + "]" + " [error] " + err.Error()
 		}
 		return true
 	}
 	return false
 }
 
-func logMessage(message string) {
-	log.Println("[info] " + message)
+func logMessage(message string, config *ClientConfig) {
+	fyneLogsChannel <- "[" + config.ServiceName + "] " + "[info] " + message
+	log.Println("[" + config.ServiceName + "] " + "[info] " + message)
 }
 
-func loadConfigFile(config *ClientConfig) {
+func loadConfigFile(configs *[]ClientConfig) {
 	bytes, err := os.ReadFile("config.json")
-	handleError(err, true)
-	err = json.Unmarshal(bytes, &config)
-	handleError(err, true)
-	logMessage("config file loaded")
+	if err != nil {
+		log.Fatalln("[error] ", err)
+	}
+	err = json.Unmarshal(bytes, &configs)
+	if err != nil {
+		log.Fatalln("[error] ", err)
+	}
+	log.Println("[info] config file loaded")
 }
 
-func loadCertificates(config *ClientConfig) {
-	certificate, err := tls.LoadX509KeyPair(config.CertificateLocation, config.KeyLocation)
-	handleError(err, true)
-	config.TLSConfig.Certificates = []tls.Certificate{certificate}
-	config.TLSConfig.InsecureSkipVerify = true
-	logMessage("certificates loaded")
+func loadCertificates(config *[]ClientConfig) {
+	for i := range configs {
+		certificate, err := tls.LoadX509KeyPair(configs[i].CertificateLocation, configs[i].KeyLocation)
+		if err != nil {
+			log.Fatalln("[error] ", err)
+		}
+		configs[i].TLSConfig.MinVersion = tls.VersionTLS13
+		configs[i].TLSConfig.Certificates = []tls.Certificate{certificate}
+		configs[i].TLSConfig.InsecureSkipVerify = true
+		logMessage("certificates loaded", &configs[i])
+	}
 }
 
-func handleLocalTCPClient(localConnection net.Conn, err error) {
+func handleLocalTCPClient(config ClientConfig, localConnection net.Conn, err error) {
 	defer localConnection.Close()
 
 	// check if connection was successfull else exit go routine
-	if handleError(err, false) {
+	if handleError(err, false, &config) {
 		return
 	}
-	logMessage("accepted connection from " + localConnection.LocalAddr().String())
+	logMessage("accepted connection from "+localConnection.LocalAddr().String(), &config)
 
 	// create connection to the remote machine
 	remoteConnection, err := tls.Dial("tcp", config.Connect, &config.TLSConfig)
-	if handleError(err, false) {
-		logMessage("local connection from " + localConnection.LocalAddr().String() + " closed because could not create connection to the remote machine " + config.Connect)
+	if handleError(err, false, &config) {
+		logMessage("local connection from "+localConnection.LocalAddr().String()+" closed because could not create connection to the remote machine "+config.Connect, &config)
 		return
 	}
 	defer remoteConnection.Close()
-	logMessage(localConnection.LocalAddr().String() + " connected to " + config.Connect)
+	logMessage(localConnection.LocalAddr().String()+" connected to "+config.Connect, &config)
 
+	// listen for incoming traffic from local app and forward it to remote machine
+	go io.Copy(remoteConnection, localConnection)
+
+	// listen for incoming traffic from remote machine and forward it to local app
+	io.Copy(localConnection, remoteConnection)
+
+	logMessage("remote connection "+config.Connect+" closed", &config)
+}
+
+func handleLocalUDPClient(config ClientConfig, localConnection *net.UDPConn, localClientAddress *net.UDPAddr, firstChunk []byte) {
+	defer logMessage("connection closed", &config)
+
+	// create tcp tunnel to serer
+	remoteConnection, err := tls.Dial("tcp", config.Connect, &config.TLSConfig)
+	if err != nil {
+		log.Fatalln("[error] ", err)
+	}
+	logMessage("connected to "+config.Connect, &config)
+
+	// listen for incoming traffic from local app and forward it to remote machine
 	go func() {
-		buff := make([]byte, 1024*16)
-		for {
-			readBytes, _ := localConnection.Read(buff) // TODO: check for error
-			remoteConnection.Write(buff[:readBytes])   // TODO: check for error
-		}
+		_, err := remoteConnection.Write(firstChunk)
+		handleError(err, false, &config)
+		_, err = io.Copy(remoteConnection, localConnection)
+		handleError(err, false, &config)
 	}()
 
+	// listen for incoming traffic from remote machine and forward it to local app
 	buff := make([]byte, 1024*16)
 	for {
-		readBytes, _ := remoteConnection.Read(buff) // TODO: check for error
-		localConnection.Write(buff[:readBytes])     // TODO: check for error
+		readBytes, err := remoteConnection.Read(buff)
+		if handleError(err, false, &config) {
+			break
+		}
+		_, err = localConnection.WriteToUDP(buff[:readBytes], localClientAddress)
+		handleError(err, false, &config)
 	}
 }
 
 func main() {
-	// load client config and certificates
-	loadConfigFile(&config)
-	loadCertificates(&config)
-	config.TLSConfig.MinVersion = tls.VersionTLS13
+	go func() {
+		// load client config and certificates
+		loadConfigFile(&configs)
+		loadCertificates(&configs)
 
-	// create listener on local machine
-	if config.Protocol == "tcp" {
-		localListener, err := net.Listen("tcp", config.Listen)
-		handleError(err, true)
-		logMessage("listening on " + config.Listen)
-		defer localListener.Close()
+		// add wait group to manage go routines
+		var wg sync.WaitGroup
 
-		// accept new connections from local apps
-		for {
-			localConnection, err := localListener.Accept()
-			go handleLocalTCPClient(localConnection, err)
-		}
-	} else {
-		defer logMessage("connection closed")
+		for _, config := range configs {
+			wg.Add(1)
+			go func(config ClientConfig) {
+				defer wg.Done()
 
-		// intial local client address to avoid extra allocations
-		var localClientAddress *net.UDPAddr
+				if config.Protocol == "tcp" {
+					// create listener on local machine
+					localListener, err := net.Listen("tcp", config.Listen)
+					if err != nil {
+						log.Fatalln("[error] ", err)
+					}
+					logMessage("listening on "+config.Listen, &config)
+					defer localListener.Close()
 
-		// create local udp listener
-		listenAddress, err := net.ResolveUDPAddr("udp", config.Listen)
-		handleError(err, true)
-		localConnection, err := net.ListenUDP("udp", listenAddress)
-		handleError(err, true)
-		logMessage("listening on " + config.Listen)
+					// accept new connections from local apps
+					for {
+						localConnection, err := localListener.Accept()
+						go handleLocalTCPClient(config, localConnection, err)
+					}
+				} else {
+					// create local udp listener
+					listenAddress, err := net.ResolveUDPAddr("udp", config.Listen)
+					if err != nil {
+						log.Fatalln("[error] ", err)
+					}
+					localConnection, err := net.ListenUDP("udp", listenAddress)
+					if err != nil {
+						log.Fatalln("[error] ", err)
+					}
+					logMessage("listening on "+config.Listen, &config)
 
-		// create tcp tunnel to serer
-		remoteConnection, err := tls.Dial("tcp", config.Connect, &config.TLSConfig)
-		handleError(err, true)
-		logMessage("connected to " + config.Connect)
+					var localClientAddress *net.UDPAddr
+					// read the first chunk to get local client address
+					firstChunk := make([]byte, 1024*16)
+					readBytes, localClientAddress, err := localConnection.ReadFromUDP(firstChunk)
+					handleError(err, false, &config)
 
-		// listen for incoming traffic from local app and forward it to remote machine
-		go func() {
-			// read the first chunk to get local client address and forward the chunk
-			defer localConnection.Close()
-			buff := make([]byte, 1024*16)
-			var readBytes int
-			readBytes, localClientAddress, err = localConnection.ReadFromUDP(buff)
-			_, err = remoteConnection.Write(buff[:readBytes])
-			handleError(err, false)
-			// repeat the last step in a loop
-			for {
-				readBytes, _, err = localConnection.ReadFromUDP(buff)
-				if handleError(err, false) {
-					break
+					// udp mode only accepts udp data from one application only
+					handleLocalUDPClient(config, localConnection, localClientAddress, firstChunk[:readBytes])
 				}
-				remoteConnection.Write(buff[:readBytes])
-			}
-		}()
-
-		// listen for incoming traffic from remote machine and forward it to local app
-		defer remoteConnection.Close()
-		buff := make([]byte, 1024*16)
-		for {
-			readBytes, err := remoteConnection.Read(buff)
-			if handleError(err, false) {
-				break
-			}
-			localConnection.WriteToUDP(buff[:readBytes], localClientAddress)
+			}(config)
 		}
+
+		wg.Wait()
+	}()
+
+	a := app.New()
+	w := a.NewWindow("TLS Tunnel")
+
+	if desk, ok := a.(desktop.App); ok {
+		m := fyne.NewMenu("TLS Tunnel",
+			fyne.NewMenuItem("Show", func() {
+				w.Show()
+			}),
+		)
+		desk.SetSystemTrayMenu(m)
 	}
+
+	logsList := widget.NewList(
+		func() int { return len(fyneLogs) },
+		func() fyne.CanvasObject { return widget.NewLabel("") },
+		func(lii widget.ListItemID, co fyne.CanvasObject) { co.(*widget.Label).SetText(fyneLogs[lii]) },
+	)
+
+	go func() {
+		for log := range fyneLogsChannel {
+			fyneLogs = append(fyneLogs, log)
+			logsList.Refresh()
+			logsList.ScrollToBottom()
+		}
+	}()
+
+	w.Resize(fyne.NewSize(1280, 720))
+	w.CenterOnScreen()
+	w.SetCloseIntercept(func() { w.Hide() })
+	w.SetContent(logsList)
+	w.ShowAndRun()
 }
